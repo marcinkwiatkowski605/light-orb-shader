@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Two translucent hemispheres of light split by a moving, saddle-shaped gap, rendered in real time with Three.js.">
+<title>Light Orb Shader</title>
+<style>
+  :root { color-scheme: dark; --bg: #000; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  canvas#c { display: block; width: 100vw; height: 100vh; }
+  .lil-gui.root { --width: 270px; }
+  @media (max-width: 600px) {
+    .lil-gui.root { --width: 220px; }
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import GUI from 'lil-gui';
+
+// ---------------------------------------------------------------------------
+// Parameters (all driven by the lil-gui panel)
+// ---------------------------------------------------------------------------
+const params = {
+  // shape
+  sphereRadius: 1.0,
+  viewTilt: 0.38,       // tips the orb towards the viewer (a slight top view)
+  cutTilt: 0.12,        // first harmonic of the cut: tilts the split between the shells
+  saddleHeight: 0.28,   // second harmonic of the cut: the saddle wave
+  cutOffset: 0,         // moves the cut up (+) or down (-) the sphere
+  gap: 0.34,            // width of the empty band between the two halves
+  edgeRound: 0.07,      // radius of the rounded edge where face meets dome
+  edgeSoftness: 0.152,
+  loopSeconds: 5,
+  cutCycles: 0,         // turns of the tilt direction per loop
+  cutPhase: -0.06,
+  wobbleTilt: 0,        // how far the split plane tips from level
+  wobbleCycles: -1,     // turns of the tip direction per loop
+  wobblePhase: 1.57,
+  spinCycles: 0,        // turns of the halves about their own axis per loop
+  precessCycles: 1,     // turns of the saddle wave per loop
+  precessPhase: 0.1,
+  orbSize: 0.42,        // sphere diameter as a fraction of the short screen side
+  // shells
+  fresnelPower: 4.16,
+  shellIntensity: 1.1,
+  interiorIntensity: 0.79,
+  limbFade: 0.175,
+  coolColor: '#7596e8',
+  warmColor: '#ff8929',
+  colorSoftness: 0.55,
+  colorPhase: 1.3,
+  colorCycles: 1,       // turns of the colours around the orb per loop
+  warmWidth: 0.57,      // width of the warm band along the edges
+  warmVariation: 0.3,   // how much the warm band varies around the orb
+  capIntensity: 1.34,   // brightness of the flat cut faces
+  dispAmount: 0.166,    // displacement map on the cut faces, as a fraction of the radius
+  dispScale: 1.51,
+  dispDrift: 0.6,
+  dispCycles: -1,
+  // lip (the glowing edge of the upper shell)
+  lip: false,
+  bandWidth: 0.035,
+  curl: 0,
+  bodyColor: '#ff8630',
+  bodyIntensity: 0.6,
+  foldPower: 4.0,
+  foldIntensity: 0.5,
+  rimWidth: 0.18,
+  rimIntensity: 0.6,
+  rimColorA: '#fff1dc',
+  rimColorB: '#ff9540',
+  backDim: 0.75,
+  haloIntensity: 0.15,
+  haloWidth: 3.0,
+  // post
+  bloomStrength: 0.43,
+  bloomRadius: 0.59,
+  bloomThreshold: 0.2,
+  blur: 0.009,          // blur radius as a fraction of the screen height
+  exposure: 1.0,
+  grain: 0.034,
+  chromatic: 0.0018,
+  vignette: 0,
+  paused: false,
+};
+
+// ?capture or ?capture=WxH renders fixed-size, deterministic frames for
+// comparing against the reference video: pixel ratio 1, no panel, no
+// animation loop (frames only come from __orb.renderFrame())
+const captureArg = new URLSearchParams(location.search).get('capture');
+const capture = captureArg === null ? null : (() => {
+  const m = /^(\d+)x(\d+)$/.exec(captureArg);
+  return m ? { w: +m[1], h: +m[2] } : { w: 1440, h: 1080 };
+})();
+
+// ---------------------------------------------------------------------------
+// Renderer / scene / camera
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('c');
+// no MSAA / depth on the canvas: the scene renders into the composer's
+// targets and only a full-screen quad ever reaches the canvas
+const renderer = new THREE.WebGLRenderer({
+  canvas, antialias: false, depth: false, powerPreference: 'high-performance',
+  preserveDrawingBuffer: !!capture,
+});
+renderer.setPixelRatio(capture ? 1 : Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 1);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = params.exposure;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
+
+// both shells and the lip live in one group, tipped towards the viewer
+const orbGroup = new THREE.Group();
+scene.add(orbGroup);
+
+// each layer registers one hook, called every frame with the loop phase
+const layerUpdates = [];
+
+const gui = new GUI({ title: 'Light orb' });
+const fShape = gui.addFolder('Shape');
+const fShells = gui.addFolder('Shells');
+const fLip = gui.addFolder('Lip');
+const fPost = gui.addFolder('Post-processing');
+
+// ---- layers ----
+// ---------------------------------------------------------------------------
+// The cut: the wavy line where the two shells meet, as a height on the unit
+// sphere for azimuth th = atan(z, x). A first harmonic tilts the split, a
+// second one bends it into a saddle. psi turns the tilt direction and phi
+// moves the saddle, each by whole cycles per loop, so the loop stays
+// seamless. The same GLSL goes into the shell and lip shaders, so the two
+// always agree.
+// ---------------------------------------------------------------------------
+const cutGlsl = /* glsl */`
+  uniform float uCutTilt;
+  uniform float uSaddle;
+  uniform float uCutOffset;
+  uniform float uPsi;
+  uniform float uPhi;
+
+  // height of the cut surface over the point xz of the horizontal plane:
+  // a tilted plane plus a saddle (hyperbolic paraboloid). On the unit circle
+  // it equals cutTilt * sin(th - psi) + saddle * sin(2 th + phi), and it is
+  // smooth everywhere, so the flat faces never pinch in the middle.
+  float cutH(vec2 xz) {
+    float tilt = uCutTilt * dot(xz, vec2(-sin(uPsi), cos(uPsi)));
+    float saddle = uSaddle * (2.0 * xz.x * xz.y * cos(uPhi) + (xz.x * xz.x - xz.y * xz.y) * sin(uPhi));
+    return tilt + saddle + uCutOffset;
+  }
+
+  // horizontal radius at which the cut surface meets the unit sphere in
+  // direction dir (a few fixed-point steps of r = sqrt(1 - cutH(dir r)^2))
+  float cutRim(vec2 dir) {
+    float r = 1.0;
+    for (int i = 0; i < 4; i++) {
+      float y = cutH(dir * r);
+      r = sqrt(max(1.0 - y * y, 0.0));
+    }
+    return r;
+  }
+`;
+
+const cutUniforms = {
+  uCutTilt: { value: 0 },
+  uSaddle: { value: 0 },
+  uCutOffset: { value: 0 },
+  uPsi: { value: 0 },
+  uPhi: { value: 0 },
+};
+
+fShape.add(params, 'sphereRadius', 0.3, 2, 0.01).name('Sphere radius');
+fShape.add(params, 'viewTilt', -1.5, 1.5, 0.01).name('View tilt');
+fShape.add(params, 'cutTilt', 0, 0.8, 0.005).name('Cut tilt');
+fShape.add(params, 'saddleHeight', 0, 0.8, 0.005).name('Saddle height');
+fShape.add(params, 'cutOffset', -0.6, 0.6, 0.005).name('Cut offset');
+fShape.add(params, 'gap', 0, 0.6, 0.005).name('Gap');
+fShape.add(params, 'edgeRound', 0, 0.4, 0.005).name('Edge rounding');
+fShape.add(params, 'edgeSoftness', 0.002, 0.3, 0.001).name('Edge softness');
+fShape.add(params, 'cutCycles', -3, 3, 1).name('Cut cycles / loop');
+fShape.add(params, 'cutPhase', -3.1416, 3.1416, 0.01).name('Cut phase');
+fShape.add(params, 'wobbleTilt', 0, 1.2, 0.005).name('Wobble tilt');
+fShape.add(params, 'wobbleCycles', -3, 3, 1).name('Wobble cycles / loop');
+fShape.add(params, 'wobblePhase', -3.1416, 3.1416, 0.01).name('Wobble phase');
+fShape.add(params, 'spinCycles', -3, 3, 1).name('Spin cycles / loop');
+fShape.add(params, 'precessCycles', -3, 3, 1).name('Saddle cycles / loop');
+fShape.add(params, 'precessPhase', -3.1416, 3.1416, 0.01).name('Saddle phase');
+
+const _q = new THREE.Quaternion();
+const _qTmp = new THREE.Quaternion();
+const _xAxis = new THREE.Vector3(1, 0, 0);
+const _yAxis = new THREE.Vector3(0, 1, 0);
+const _wobbleAxis = new THREE.Vector3();
+
+layerUpdates.push((phase) => {
+  // view tilt, then a wobble: the split plane tips by wobbleTilt towards a
+  // direction that circles the vertical axis (like a spinning coin settling),
+  // then an optional spin of the halves about their own axis
+  const psi = params.wobblePhase + params.wobbleCycles * phase;
+  _wobbleAxis.set(Math.cos(psi), 0, Math.sin(psi));
+  _q.setFromAxisAngle(_xAxis, params.viewTilt);
+  _q.multiply(_qTmp.setFromAxisAngle(_wobbleAxis, params.wobbleTilt));
+  _q.multiply(_qTmp.setFromAxisAngle(_yAxis, params.spinCycles * phase));
+  orbGroup.quaternion.copy(_q);
+  const u = cutUniforms;
+  u.uCutTilt.value = params.cutTilt;
+  u.uSaddle.value = params.saddleHeight;
+  u.uCutOffset.value = params.cutOffset;
+  // integer cycles keep the loop seamless
+  u.uPsi.value = params.cutPhase + params.cutCycles * phase;
+  u.uPhi.value = params.precessPhase + params.precessCycles * phase;
+});
+
+// ---------------------------------------------------------------------------
+// Shells: two translucent halves of one sphere, split along the cut and
+// separated by an empty band (the gap). Each half is a curved dome plus a
+// flat face where the sphere was cut. Brightness is a fresnel term (softer
+// on the far wall, faded right at the silhouette so the brightest band sits
+// just inside it). Each half carries two colours around its azimuth,
+// turning with the cut; the lower half has them the other way round.
+// ---------------------------------------------------------------------------
+const shellVert = /* glsl */`
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying vec3 vNormalO;
+
+  void main() {
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vNormalV = normalize(normalMatrix * normal);
+    vViewV = normalize(-mv.xyz);
+    vNormalO = normal;
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+// The cut faces: a dense disc per half, built in the vertex shader on the
+// cut (uv.x runs around, uv.y from the centre to the rim). Only these faces
+// carry the displacement map: two octaves of noise over the plane, pushed
+// along the face normal. The rim moves too, and the dome's edge follows the
+// same noise, so face and dome stay joined. The noise drifts around a circle once per cycle, so
+// the loop stays seamless; each half gets its own seed.
+const dispGlsl = /* glsl */`
+  uniform float uSide;
+  uniform float uDispAmount;
+  uniform float uDispScale;
+  uniform float uDispDrift;
+  uniform float uDispPhase;
+
+  float hash(vec3 p) { return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+
+  // smooth 3D value noise, 0..1
+  float vnoise(vec3 p) {
+    vec3 i = floor(p);
+    vec3 f = fract(p);
+    vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    return mix(
+      mix(mix(hash(i), hash(i + vec3(1, 0, 0)), u.x),
+          mix(hash(i + vec3(0, 1, 0)), hash(i + vec3(1, 1, 0)), u.x), u.y),
+      mix(mix(hash(i + vec3(0, 0, 1)), hash(i + vec3(1, 0, 1)), u.x),
+          mix(hash(i + vec3(0, 1, 1)), hash(i + vec3(1, 1, 1)), u.x), u.y),
+      u.z);
+  }
+
+  float displacement(vec2 xz) {
+    vec3 q = vec3(xz.x, 0.0, xz.y) * uDispScale
+           + vec3(cos(uDispPhase), sin(uDispPhase), 0.0) * uDispDrift
+           + uSide * 7.31;
+    float h = vnoise(q) * 0.65 + vnoise(q * 2.03 + 17.0) * 0.35;
+    return (h - 0.5) * 2.0 * uDispAmount;
+  }
+`;
+
+const capVert = /* glsl */`
+  ${cutGlsl}
+  ${dispGlsl}
+  uniform float uGap;
+  uniform float uRound;
+
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying vec3 vNormalO;
+  varying float vEdgeDist;
+
+  // the cut face for q = direction * s (s = 0 centre .. 1 rim), displaced
+  // along its normal; the rim moves with it and stays on the sphere
+  //
+  // Near the rim the face bends up into the dome along a quarter circle of
+  // radius uRound (a fillet), so the half has a rounded edge instead of a
+  // sharp one. s runs over the flat part first, then over the arc, in
+  // proportion to their lengths.
+  vec3 capPos(vec2 q) {
+    float s = length(q);
+    vec2 dir = s > 1e-5 ? q / s : vec2(1.0, 0.0);
+    float rim = max(cutRim(dir), 1e-3);
+    float rimY = cutH(dir * rim) + uSide * (0.5 * uGap + displacement(dir * rim));
+    // top of the fillet: where it meets the dome, on the sphere
+    float topY = rimY + uSide * uRound;
+    float rc = max(sqrt(max(1.0 - topY * topY, 0.0)) - uRound, 0.0);
+    float k = rc / max(rc + uRound * 1.5707963, 1e-4);
+
+    vec2 xz;
+    float lift = 0.0;
+    if (s < k) {
+      xz = dir * (s / k) * rc;
+    } else {
+      float a = (s - k) / max(1.0 - k, 1e-4) * 1.5707963;
+      xz = dir * (rc + uRound * sin(a));
+      lift = uRound * (1.0 - cos(a));
+    }
+    vec2 base = s < k ? xz : dir * rc;
+    float y = cutH(base) + uSide * (0.5 * uGap + displacement(xz) + lift);
+    return vec3(xz.x, y, xz.y);
+  }
+
+  void main() {
+    float th = 6.2831853 * uv.x;
+    vec2 q = vec2(cos(th), sin(th)) * uv.y;
+    vec3 p = capPos(q);
+
+    float e = 0.004;
+    vec3 n = normalize(cross(capPos(q + vec2(0.0, e)) - capPos(q - vec2(0.0, e)),
+                             capPos(q + vec2(e, 0.0)) - capPos(q - vec2(e, 0.0))));
+
+    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+    vNormalV = normalize(normalMatrix * n);
+    vViewV = normalize(-mv.xyz);
+    // only the azimuth is used for the face's colours
+    vNormalO = vec3(cos(th), 0.0, sin(th));
+    // rough distance from the face's rim, for the warm edge band
+    vEdgeDist = (1.0 - uv.y) * cutRim(vec2(cos(th), sin(th)));
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const shellFrag = /* glsl */`
+  ${cutGlsl}
+  ${dispGlsl}
+  uniform vec3 uCool;
+  uniform vec3 uWarm;
+  uniform float uColorSoft;
+  uniform float uWarmWidth;
+  uniform float uWarmVary;
+  uniform float uColorPhase;
+  uniform float uGap;
+  uniform float uRound;
+  uniform float uEdgeSoft;
+  uniform float uFresnelPower;
+  uniform float uShell;
+  uniform float uInterior;
+  uniform float uLimbFade;
+  uniform float uCapGain;
+
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying vec3 vNormalO;
+  #ifdef CAP
+  varying float vEdgeDist;
+  #endif
+
+  void main() {
+    vec3 n = normalize(vNormalO);
+    float th = atan(n.z, n.x);
+    float d = n.y - cutH(n.xz);   // > 0 above the cut
+
+  #ifdef CAP
+    float mask = uCapGain;
+  #else
+    // distance past this half's own edge: each half stops gap/2 short of the
+    // cut, and the edge follows the cut face's displacement
+    float inside = uSide * d - 0.5 * uGap - displacement(n.xz) - uRound;
+    float mask = smoothstep(-uEdgeSoft, uEdgeSoft, inside);
+    if (mask <= 0.0) discard;
+  #endif
+
+    float facing = min(abs(dot(normalize(vNormalV), normalize(vViewV))), 1.0);
+    float fres = gl_FrontFacing
+      ? pow(1.0 - facing, uFresnelPower) * uShell
+      : pow(1.0 - facing, uFresnelPower * 0.5) * uInterior;
+    fres *= smoothstep(0.0, uLimbFade, facing);
+
+    // cool body; the warm colour only shows in a band along the edges where
+    // the two halves meet. Its strength varies around the orb, and that
+    // pattern turns with the colour phase.
+  #ifdef CAP
+    float edgeDist = vEdgeDist;
+  #else
+    float edgeDist = max(inside, 0.0);
+  #endif
+    float band = 1.0 - smoothstep(0.0, uWarmWidth, edgeDist);
+    float k = uSide * sin(th - uPsi + uColorPhase);
+    float vary = mix(1.0, smoothstep(-uColorSoft, uColorSoft, k), uWarmVary);
+    vec3 col = mix(uCool, uWarm, band * vary) * fres;
+
+    gl_FragColor = vec4(col * mask, 1.0);
+  }
+`;
+
+// uniforms both shells take straight from params (shared { value } objects)
+const shellUniforms = {
+  uCool: { value: new THREE.Color() },
+  uWarm: { value: new THREE.Color() },
+  uColorSoft: { value: 0 },
+  uWarmWidth: { value: 0 },
+  uWarmVary: { value: 0 },
+  uColorPhase: { value: 0 },
+  uGap: { value: 0 },
+  uRound: { value: 0 },
+  uEdgeSoft: { value: 0 },
+  uFresnelPower: { value: 0 },
+  uShell: { value: 0 },
+  uInterior: { value: 0 },
+  uLimbFade: { value: 0 },
+  uDispAmount: { value: 0 },
+  uDispScale: { value: 0 },
+  uDispDrift: { value: 0 },
+  uDispPhase: { value: 0 },
+  uCapGain: { value: 0 },
+};
+
+const shellGeometry = new THREE.SphereGeometry(1, 128, 96);
+const capGeometry = new THREE.PlaneGeometry(1, 1, 192, 96);
+
+function makeShell(side, cap = false) {
+  const mesh = new THREE.Mesh(cap ? capGeometry : shellGeometry, new THREE.ShaderMaterial({
+    vertexShader: cap ? capVert : shellVert,
+    fragmentShader: shellFrag,
+    defines: cap ? { CAP: 1 } : {},
+    uniforms: { ...cutUniforms, ...shellUniforms, uSide: { value: side } },
+    side: THREE.DoubleSide,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+  }));
+  mesh.frustumCulled = false;
+  orbGroup.add(mesh);
+  return mesh;
+}
+
+const upperShell = makeShell(1);
+const lowerShell = makeShell(-1);
+const upperCap = makeShell(1, true);
+const lowerCap = makeShell(-1, true);
+
+fShells.add(params, 'fresnelPower', 0.3, 8, 0.01).name('Fresnel power');
+fShells.add(params, 'shellIntensity', 0, 4, 0.01).name('Shell brightness');
+fShells.add(params, 'interiorIntensity', 0, 4, 0.01).name('Interior brightness');
+fShells.add(params, 'limbFade', 0.01, 1, 0.005).name('Limb fade');
+fShells.addColor(params, 'coolColor').name('Cool colour');
+fShells.addColor(params, 'warmColor').name('Warm colour');
+fShells.add(params, 'colorSoftness', 0.01, 1.5, 0.01).name('Colour softness');
+fShells.add(params, 'colorPhase', -3.1416, 3.1416, 0.01).name('Colour phase');
+fShells.add(params, 'colorCycles', -3, 3, 1).name('Colour cycles / loop');
+fShells.add(params, 'warmWidth', 0.005, 1, 0.005).name('Warm edge width');
+fShells.add(params, 'warmVariation', 0, 1, 0.01).name('Warm edge variation');
+fShells.add(params, 'capIntensity', 0, 3, 0.01).name('Cut face brightness');
+fShells.add(params, 'dispAmount', 0, 0.4, 0.001).name('Displacement');
+fShells.add(params, 'dispScale', 0.2, 10, 0.01).name('Displacement scale');
+fShells.add(params, 'dispDrift', 0, 3, 0.01).name('Displacement drift');
+fShells.add(params, 'dispCycles', -3, 3, 1).name('Displacement cycles / loop');
+
+layerUpdates.push((phase) => {
+  const u = shellUniforms;
+  for (const m of [upperShell, lowerShell, upperCap, lowerCap]) m.scale.setScalar(params.sphereRadius);
+  u.uCapGain.value = params.capIntensity;
+  u.uCool.value.set(params.coolColor);
+  u.uWarm.value.set(params.warmColor);
+  u.uColorSoft.value = params.colorSoftness;
+  u.uWarmWidth.value = params.warmWidth;
+  u.uWarmVary.value = params.warmVariation;
+  // the colours turn around the orb; integer cycles keep the loop seamless
+  u.uColorPhase.value = params.colorPhase - params.colorCycles * phase;
+  u.uGap.value = params.gap;
+  u.uRound.value = params.edgeRound;
+  u.uEdgeSoft.value = params.edgeSoftness;
+  u.uFresnelPower.value = params.fresnelPower;
+  u.uShell.value = params.shellIntensity;
+  u.uInterior.value = params.interiorIntensity;
+  u.uLimbFade.value = params.limbFade;
+  u.uDispAmount.value = params.dispAmount;
+  u.uDispScale.value = params.dispScale;
+  u.uDispDrift.value = params.dispDrift;
+  // integer cycles keep the loop seamless
+  u.uDispPhase.value = params.dispCycles * phase;
+});
+
+// ---------------------------------------------------------------------------
+// Lip: the bright edge of the upper shell, drawn as a thin band that runs
+// exactly along the cut on the sphere surface. The band lies along the
+// meridian; curl tips it into the sphere. It keeps the film look of the
+// original ribbon: a body brighter where it faces the camera, a fold where
+// it turns edge-on, and rims along both edges.
+// ---------------------------------------------------------------------------
+const lipVert = /* glsl */`
+  ${cutGlsl}
+  uniform float uRadius;
+  uniform float uWidth;
+  uniform float uCurl;
+
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying float vV;
+  varying float vFront;
+
+  vec3 lipPos(float u, float v) {
+    float th = 6.2831853 * u;
+    vec2 dir = vec2(cos(th), sin(th));
+    float r = max(cutRim(dir), 0.03);
+    float y = cutH(dir * r);
+    vec3 onSphere = vec3(cos(th) * r, y, sin(th) * r);
+    // unit tangent along the meridian, towards the north pole
+    vec3 up = vec3(-cos(th) * y, r, -sin(th) * y);
+    vec3 across = cos(uCurl) * up - sin(uCurl) * onSphere;
+    return uRadius * onSphere + across * (v * uWidth);
+  }
+
+  void main() {
+    float u = uv.x;
+    float v = uv.y * 2.0 - 1.0;
+    vec3 p = lipPos(u, v);
+
+    float e = 0.001;
+    vec3 du = lipPos(u + e, v) - lipPos(u - e, v);
+    vec3 dv = lipPos(u, v + e) - lipPos(u, v - e);
+    // guard against a zero-length normal (NaN would be smeared by the bloom)
+    vec3 c = cross(du, dv);
+    float cl = length(c);
+    vec3 n = cl > 1e-9 ? c / cl : vec3(0.0, 0.0, 1.0);
+
+    vec4 mv = modelViewMatrix * vec4(p, 1.0);
+    float originZ = (modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).z;
+    vNormalV = normalize(normalMatrix * n);
+    vViewV = normalize(-mv.xyz);
+    vV = v;
+    // -1 at the back of the orb, +1 at the front
+    vFront = clamp((mv.z - originZ) / max(uRadius, 1e-4), -1.0, 1.0);
+    gl_Position = projectionMatrix * mv;
+  }
+`;
+
+const lipFrag = /* glsl */`
+  uniform vec3 uBodyColor;
+  uniform float uBodyIntensity;
+  uniform float uFoldPower;
+  uniform float uFoldIntensity;
+  uniform float uRimWidth;
+  uniform float uRimIntensity;
+  uniform vec3 uRimColorA;
+  uniform vec3 uRimColorB;
+  uniform float uBackDim;
+  uniform float uGain;
+
+  varying vec3 vNormalV;
+  varying vec3 vViewV;
+  varying float vV;
+  varying float vFront;
+
+  void main() {
+    float nl = length(vNormalV);
+    float facing = nl > 1e-5 ? min(abs(dot(vNormalV / nl, normalize(vViewV))), 1.0) : 0.0;
+
+  #ifdef SOFT_CORE
+    // halo: a wide, soft gaussian across the band
+    vec3 col = uBodyColor * exp(-vV * vV * 2.5);
+  #else
+    // translucent amber body, brighter where the band faces the camera
+    vec3 col = uBodyColor * uBodyIntensity * (0.25 + 0.75 * facing);
+
+    // cream fold where the band turns edge-on to the camera
+    col += vec3(1.0, 0.93, 0.82) * pow(1.0 - facing, uFoldPower) * uFoldIntensity;
+
+    // rims on both edges: cream outermost, fading to amber inside
+    float s = (1.0 - abs(vV)) / uRimWidth;
+    vec3 rimCol = mix(uRimColorA, uRimColorB, smoothstep(0.5, 2.0, s));
+    col += rimCol * exp(-s * s * 0.18) * uRimIntensity;
+  #endif
+
+    // the far side of the orb is fainter
+    col *= mix(uBackDim, 1.0, smoothstep(-1.0, 1.0, vFront)) * uGain;
+    if (any(isnan(col)) || any(isinf(col))) col = vec3(0.0);
+    gl_FragColor = vec4(clamp(col, 0.0, 64.0), 1.0);
+  }
+`;
+
+// uniforms both lip layers take straight from params (shared { value } objects)
+const lipUniforms = {
+  uRadius: { value: 1 },
+  uCurl: { value: 0 },
+  uBodyColor: { value: new THREE.Color() },
+  uBodyIntensity: { value: 0 },
+  uFoldPower: { value: 0 },
+  uFoldIntensity: { value: 0 },
+  uRimWidth: { value: 0 },
+  uRimIntensity: { value: 0 },
+  uRimColorA: { value: new THREE.Color() },
+  uRimColorB: { value: new THREE.Color() },
+  uBackDim: { value: 0 },
+};
+
+// uv.x runs around the cut, uv.y across the band
+const lipGeometry = new THREE.PlaneGeometry(1, 1, 256, 24);
+
+function makeLip(defines = {}) {
+  const mesh = new THREE.Mesh(lipGeometry, new THREE.ShaderMaterial({
+    vertexShader: lipVert,
+    fragmentShader: lipFrag,
+    defines,
+    uniforms: { ...cutUniforms, ...lipUniforms, uWidth: { value: 0 }, uGain: { value: 1 } },
+    side: THREE.DoubleSide,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+  }));
+  mesh.frustumCulled = false;
+  orbGroup.add(mesh);
+  return mesh;
+}
+
+const haloLip = makeLip({ SOFT_CORE: 1 });
+const mainLip = makeLip();
+
+fLip.add(params, 'lip').name('Show lip');
+fLip.add(params, 'bandWidth', 0.005, 0.3, 0.001).name('Band width');
+fLip.add(params, 'curl', -1.5708, 1.5708, 0.01).name('Curl');
+fLip.addColor(params, 'bodyColor').name('Body colour');
+fLip.add(params, 'bodyIntensity', 0, 3, 0.01).name('Body brightness');
+fLip.add(params, 'foldPower', 1, 20, 0.1).name('Fold sharpness');
+fLip.add(params, 'foldIntensity', 0, 8, 0.01).name('Fold brightness');
+fLip.add(params, 'rimWidth', 0.01, 0.5, 0.001).name('Rim width');
+fLip.add(params, 'rimIntensity', 0, 5, 0.01).name('Rim brightness');
+fLip.addColor(params, 'rimColorA').name('Rim – outer');
+fLip.addColor(params, 'rimColorB').name('Rim – inner');
+fLip.add(params, 'backDim', 0, 1, 0.01).name('Back side brightness');
+fLip.add(params, 'haloIntensity', 0, 3, 0.01).name('Halo brightness');
+fLip.add(params, 'haloWidth', 1, 8, 0.05).name('Halo width');
+
+layerUpdates.push(() => {
+  const u = lipUniforms;
+  u.uRadius.value = params.sphereRadius;
+  u.uCurl.value = params.curl;
+  u.uBodyColor.value.set(params.bodyColor);
+  u.uBodyIntensity.value = params.bodyIntensity;
+  u.uFoldPower.value = params.foldPower;
+  u.uFoldIntensity.value = params.foldIntensity;
+  u.uRimWidth.value = params.rimWidth;
+  u.uRimIntensity.value = params.rimIntensity;
+  u.uRimColorA.value.set(params.rimColorA);
+  u.uRimColorB.value.set(params.rimColorB);
+  u.uBackDim.value = params.backDim;
+
+  const width = params.bandWidth * params.sphereRadius;
+  mainLip.visible = haloLip.visible = params.lip;
+  mainLip.material.uniforms.uWidth.value = width;
+  haloLip.material.uniforms.uWidth.value = width * params.haloWidth;
+  haloLip.material.uniforms.uGain.value = params.haloIntensity;
+});
+
+// ---------------------------------------------------------------------------
+// Post-processing: bloom, a wide soft blur, tone mapping, then finish
+// ---------------------------------------------------------------------------
+// the layers never depth-test, so the composer targets need no depth buffer
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false }));
+composer.addPass(new RenderPass(scene, camera));
+
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), params.bloomStrength, params.bloomRadius, params.bloomThreshold);
+composer.addPass(bloom);
+
+const fullscreenVert = /* glsl */`
+  varying vec2 vUv;
+  void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+`;
+
+// separable gaussian blur, run in linear HDR space before tone mapping
+const blurShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    uDir: { value: new THREE.Vector2(1, 0) },
+    uRadius: { value: 0 },
+    uResolution: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: fullscreenVert,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform vec2 uDir;
+    uniform float uRadius;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+    void main() {
+      // 13 taps spread over the radius, gaussian weights (sigma = radius / 2)
+      vec2 stepUv = uDir * (uRadius / 6.0) / uResolution;
+      vec4 sum = vec4(0.0);
+      float wsum = 0.0;
+      for (int i = -6; i <= 6; i++) {
+        float x = float(i);
+        float w = exp(-(x * x) / 18.0);
+        sum += texture2D(tDiffuse, vUv + stepUv * x) * w;
+        wsum += w;
+      }
+      gl_FragColor = sum / wsum;
+    }
+  `,
+};
+// two H+V rounds: the second one only runs for large radii, where 13 taps
+// over one round would start to show banding
+const blurPasses = [0, 1, 2, 3].map((i) => {
+  const p = new ShaderPass(blurShader);
+  if (i % 2 === 1) p.uniforms.uDir.value.set(0, 1);
+  composer.addPass(p);
+  return p;
+});
+
+composer.addPass(new OutputPass());
+
+// chromatic aberration, vignette and grain in display space, after tone
+// mapping (grain in linear space lifts the blacks a lot)
+const finishPass = new ShaderPass({
+  uniforms: {
+    tDiffuse: { value: null },
+    uChromatic: { value: 0 },
+    uGrain: { value: 0 },
+    uVignette: { value: 0 },
+    uTime: { value: 0 },
+    uAspect: { value: 1 },
+  },
+  vertexShader: fullscreenVert,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform float uChromatic;
+    uniform float uGrain;
+    uniform float uVignette;
+    uniform float uTime;
+    uniform float uAspect;
+    varying vec2 vUv;
+
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+    void main() {
+      vec2 d = vUv - 0.5;
+      d.x *= uAspect;
+      float len = length(d);
+      vec2 dir = len > 0.0 ? normalize(vUv - 0.5) : vec2(0.0);
+      vec2 off = dir * uChromatic * (0.35 + len * 1.6);
+      vec3 col = vec3(
+        texture2D(tDiffuse, vUv + off).r,
+        texture2D(tDiffuse, vUv).g,
+        texture2D(tDiffuse, vUv - off).b);
+
+      col *= mix(1.0 - uVignette, 1.0, smoothstep(0.95, 0.25, len));
+      col += (hash(vUv * 1024.0 + fract(uTime) * 91.7) - 0.5) * uGrain;
+
+      gl_FragColor = vec4(max(col, 0.0), 1.0);
+    }
+  `,
+});
+composer.addPass(finishPass);
+
+// ---------------------------------------------------------------------------
+// GUI (shared + post; each layer adds its own controls above)
+// ---------------------------------------------------------------------------
+fShape.add(params, 'loopSeconds', 1, 20, 0.5).name('Loop length (s)');
+fShape.add(params, 'orbSize', 0.1, 0.9, 0.005).name('Orb size');
+
+fPost.add(params, 'bloomStrength', 0, 3, 0.01).name('Bloom strength');
+fPost.add(params, 'bloomRadius', 0, 1.5, 0.01).name('Bloom radius');
+fPost.add(params, 'bloomThreshold', 0, 1, 0.005).name('Bloom threshold');
+fPost.add(params, 'blur', 0, 0.08, 0.001).name('Blur (× height)');
+fPost.add(params, 'exposure', 0.2, 2.5, 0.01).name('Exposure');
+fPost.add(params, 'grain', 0, 0.12, 0.001).name('Grain');
+fPost.add(params, 'chromatic', 0, 0.02, 0.0001).name('Chromatic aberration');
+fPost.add(params, 'vignette', 0, 1, 0.01).name('Vignette');
+gui.add(params, 'paused').name('Pause');
+
+// ---------------------------------------------------------------------------
+// Resize + frame update + loop
+// ---------------------------------------------------------------------------
+const drawingBufferSize = new THREE.Vector2();
+function resize() {
+  const w = capture ? capture.w : window.innerWidth;
+  const h = capture ? capture.h : window.innerHeight;
+  renderer.setSize(w, h, false);
+  composer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  finishPass.uniforms.uAspect.value = w / h;
+  renderer.getDrawingBufferSize(drawingBufferSize);
+  for (const p of blurPasses) p.uniforms.uResolution.value.copy(drawingBufferSize);
+}
+// resize at most once per frame (every composer.setSize reallocates targets)
+let needsResize = true;
+window.addEventListener('resize', () => { needsResize = true; });
+
+let simTime = 0;
+
+function update() {
+  if (needsResize) { needsResize = false; resize(); }
+  const phase = 2 * Math.PI * simTime / params.loopSeconds;
+
+  // place the camera so the sphere covers orbSize of the short screen side:
+  // a sphere of radius R at distance d spans a cone with sin(a) = R / d
+  const tanHalf = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+  const tanA = params.orbSize * tanHalf * Math.min(1, camera.aspect);
+  camera.position.set(0, 0, params.sphereRadius / Math.sin(Math.atan(tanA)));
+  camera.lookAt(0, 0, 0);
+
+  for (const fn of layerUpdates) fn(phase);
+
+  bloom.strength = params.bloomStrength;
+  bloom.radius = params.bloomRadius;
+  bloom.threshold = params.bloomThreshold;
+  renderer.toneMappingExposure = params.exposure;
+
+  const blurPx = params.blur * drawingBufferSize.y;
+  const twoRounds = blurPx > 24;
+  blurPasses.forEach((p, i) => {
+    p.enabled = blurPx > 0.05 && (i < 2 || twoRounds);
+    p.uniforms.uRadius.value = twoRounds ? blurPx / Math.SQRT2 : blurPx;
+  });
+
+  const f = finishPass.uniforms;
+  f.uChromatic.value = params.chromatic;
+  f.uGrain.value = params.grain;
+  f.uVignette.value = params.vignette;
+  f.uTime.value = simTime;
+}
+
+function renderFrame() {
+  update();
+  composer.render();
+}
+
+const clock = new THREE.Clock();
+function tick() {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  if (!params.paused) simTime += dt;
+  renderFrame();
+  requestAnimationFrame(tick);
+}
+
+if (capture) {
+  gui.hide();
+  renderFrame();
+} else {
+  if (window.innerWidth < 700) gui.close();
+  tick();
+}
+
+// debug / capture handle
+window.__orb = { params, setTime: (t) => { simTime = t; }, renderFrame, renderer, composer };
+</script>
+</body>
+</html>
