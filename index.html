@@ -77,21 +77,6 @@ const params = {
   dispScale: 1.51,
   dispDrift: 0.6,
   dispCycles: -1,
-  // lip (the glowing edge of the upper shell)
-  lip: false,
-  bandWidth: 0.035,
-  curl: 0,
-  bodyColor: '#ff8630',
-  bodyIntensity: 0.6,
-  foldPower: 4.0,
-  foldIntensity: 0.5,
-  rimWidth: 0.18,
-  rimIntensity: 0.6,
-  rimColorA: '#fff1dc',
-  rimColorB: '#ff9540',
-  backDim: 0.75,
-  haloIntensity: 0.15,
-  haloWidth: 3.0,
   // post
   bloomStrength: 0.43,
   bloomRadius: 0.59,
@@ -101,6 +86,23 @@ const params = {
   grain: 0.034,
   chromatic: 0.0018,
   vignette: 0,
+  // voice (microphone loudness modulates the orb)
+  voiceMinDb: -60,      // input at or below this is silence (level 0)
+  voiceMaxDb: -18,      // input at or above this is full level (level 1)
+  voiceAttack: 0.04,    // seconds to rise towards a louder level
+  voiceRelease: 0.35,   // seconds to fall back when it gets quieter
+  voiceGap: 0.22,       // extra gap at full level
+  voiceGlow: 0.45,      // extra shell / face brightness at full level (× base)
+  voicePulse: 0.08,     // extra sphere radius at full level (× base)
+  voiceRipple: 0.12,    // extra displacement at full level
+  voiceChurn: 2.5,      // how fast the displacement churns while speaking (rad/s)
+  voiceIdleSpeed: 0.06, // loop speed in silence while the mic is on (× base)
+  voiceSpeed: 2.5,      // extra loop speed at full level (× base)
+  voiceSpinUp: 0.25,    // seconds the motion takes to speed up with the voice
+  voiceSpinDown: 1.2,   // seconds the motion takes to coast down after
+  voiceBreath: 0.12,    // gentle breathing in silence, as a voice level
+  voiceBreathSeconds: 4.5,
+  voiceBloom: 0.3,      // extra bloom strength at full level
   paused: false,
 };
 
@@ -131,7 +133,7 @@ renderer.toneMappingExposure = params.exposure;
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(32, 1, 0.1, 100);
 
-// both shells and the lip live in one group, tipped towards the viewer
+// both shells and their cut faces live in one group, tipped towards the viewer
 const orbGroup = new THREE.Group();
 scene.add(orbGroup);
 
@@ -141,8 +143,138 @@ const layerUpdates = [];
 const gui = new GUI({ title: 'Light orb' });
 const fShape = gui.addFolder('Shape');
 const fShells = gui.addFolder('Shells');
-const fLip = gui.addFolder('Lip');
 const fPost = gui.addFolder('Post-processing');
+const fVoice = gui.addFolder('Voice');
+
+// ---------------------------------------------------------------------------
+// Voice: microphone loudness as a smoothed 0..1 level. The RMS of each audio
+// frame is mapped from [voiceMinDb, voiceMaxDb] to 0..1, then follows the
+// input with a fast attack and a slower release so the orb swells with each
+// syllable and settles between words. The layers add their voice* amounts
+// on top of the base params, so the panel values stay the resting look.
+// voice.phase accumulates while speaking and drives the
+// displacement churn.
+//
+// With the mic on, the voice also drives the motion: voice.speed scales how
+// fast the loop runs, from voiceIdleSpeed in silence up with the level,
+// winding up quickly while you speak and coasting to a near stop after. In
+// silence voice.amp breathes slowly, so the orb never looks frozen; the
+// layers read voice.amp (the level with the breath blended in under it).
+// ---------------------------------------------------------------------------
+// honour the system "reduce motion" setting: the loop runs at a quarter of its
+// usual speed (near still with the mic on), and the voice no longer scales,
+// spins up or churns the orb; brightness and the gap still follow it, so it
+// still shows that it is listening
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+const voice = {
+  level: 0,
+  amp: 0,
+  breathMix: 0,
+  ackTime: Infinity,   // seconds since the mic turned on
+  speed: 1,
+  phase: 0,
+  enabled: false,
+  starting: false,     // waiting for the mic permission; ignores further clicks
+  stream: null,
+  ctx: null,
+  analyser: null,
+  buf: null,
+};
+
+async function startVoice() {
+  voice.starting = true;
+  voiceButton.name('Waiting for microphone…');
+  try {
+    voice.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false },
+    });
+  } catch (err) {
+    console.warn('Microphone unavailable:', err);
+    voiceButton.name(err && err.name === 'NotAllowedError' ? 'Mic blocked – retry' : 'No mic – retry');
+    return;
+  } finally {
+    voice.starting = false;
+  }
+  voice.ctx = new AudioContext();
+  // the permission prompt can use up the click, leaving the context suspended (Safari)
+  voice.ctx.resume();
+  voice.analyser = voice.ctx.createAnalyser();
+  voice.analyser.fftSize = 1024;
+  voice.buf = new Float32Array(voice.analyser.fftSize);
+  voice.ctx.createMediaStreamSource(voice.stream).connect(voice.analyser);
+  voice.enabled = true;
+  voice.ackTime = 0;
+  voiceButton.name('Disable microphone');
+}
+
+function stopVoice() {
+  voice.enabled = false;
+  voice.stream?.getTracks().forEach((t) => t.stop());
+  voice.ctx?.close();
+  voice.stream = voice.ctx = voice.analyser = null;
+  voiceButton.name('Enable microphone');
+}
+
+// dt is real time (the level keeps following the mic while paused);
+// motionDt is scaled by the pause, so the churn stops with the rest
+function updateVoice(dt, time, motionDt) {
+  let target = 0;
+  if (voice.enabled) {
+    voice.analyser.getFloatTimeDomainData(voice.buf);
+    let sum = 0;
+    for (const s of voice.buf) sum += s * s;
+    const db = 10 * Math.log10(sum / voice.buf.length + 1e-12);
+    target = THREE.MathUtils.clamp((db - params.voiceMinDb) / Math.max(params.voiceMaxDb - params.voiceMinDb, 1), 0, 1);
+  }
+  const tau = target > voice.level ? params.voiceAttack : params.voiceRelease;
+  voice.level = THREE.MathUtils.damp(voice.level, target, 1 / tau, dt);
+  voice.phase += motionDt * voice.level * (reducedMotion.matches ? 0 : params.voiceChurn);
+
+  // motion: near still in silence, faster with the voice; plain speed with the mic off.
+  // It winds up quickly and coasts down slowly.
+  const speedUp = reducedMotion.matches ? 0 : params.voiceSpeed;
+  const speedTarget = voice.enabled ? params.voiceIdleSpeed + speedUp * voice.level : 1;
+  const spin = speedTarget > voice.speed ? params.voiceSpinUp : params.voiceSpinDown;
+  voice.speed = THREE.MathUtils.damp(voice.speed, speedTarget, 1 / spin, dt);
+
+  // the breathing fades in and out with the mic instead of switching
+  voice.breathMix = THREE.MathUtils.damp(voice.breathMix, voice.enabled ? 1 : 0, 1 / 0.6, dt);
+  const breath = voice.breathMix * params.voiceBreath
+    * (0.5 - 0.5 * Math.cos(2 * Math.PI * time / params.voiceBreathSeconds));
+  // soft union: the breath fills in under the voice and fades out as it gets louder
+  voice.amp = voice.level + breath * (1 - voice.level);
+
+  // one soft swell when the mic turns on, to show the orb is listening
+  voice.ackTime += dt;
+  const ack = voice.ackTime < 0.4 ? 0.35 * Math.sin(Math.PI * voice.ackTime / 0.4) : 0;
+  voice.amp += ack * (1 - voice.amp);
+}
+
+const voiceActions = {
+  toggle: () => {
+    if (voice.starting) return;
+    voice.enabled ? stopVoice() : startVoice();
+  },
+};
+const voiceButton = fVoice.add(voiceActions, 'toggle').name('Enable microphone');
+fVoice.add(voice, 'level', 0, 1).name('Level').listen().disable();
+fVoice.add(params, 'voiceMinDb', -90, -20, 1).name('Silence below (dB)');
+fVoice.add(params, 'voiceMaxDb', -50, 0, 1).name('Full level at (dB)');
+fVoice.add(params, 'voiceAttack', 0.005, 0.5, 0.005).name('Attack (s)');
+fVoice.add(params, 'voiceRelease', 0.02, 2, 0.01).name('Release (s)');
+fVoice.add(params, 'voiceGap', 0, 0.6, 0.005).name('Gap opens');
+fVoice.add(params, 'voiceGlow', 0, 3, 0.01).name('Glow');
+fVoice.add(params, 'voicePulse', 0, 0.5, 0.005).name('Pulse');
+fVoice.add(params, 'voiceRipple', 0, 0.4, 0.001).name('Ripple');
+fVoice.add(params, 'voiceChurn', 0, 10, 0.05).name('Churn');
+fVoice.add(params, 'voiceIdleSpeed', 0, 1, 0.01).name('Speed in silence');
+fVoice.add(params, 'voiceSpeed', 0, 6, 0.01).name('Speed up');
+fVoice.add(params, 'voiceSpinUp', 0.02, 2, 0.01).name('Spin up (s)');
+fVoice.add(params, 'voiceSpinDown', 0.05, 4, 0.01).name('Wind down (s)');
+fVoice.add(params, 'voiceBreath', 0, 0.5, 0.005).name('Breathing');
+fVoice.add(params, 'voiceBreathSeconds', 1, 10, 0.1).name('Breath length (s)');
+fVoice.add(params, 'voiceBloom', 0, 3, 0.01).name('Bloom');
 
 // ---- layers ----
 // ---------------------------------------------------------------------------
@@ -150,7 +282,7 @@ const fPost = gui.addFolder('Post-processing');
 // sphere for azimuth th = atan(z, x). A first harmonic tilts the split, a
 // second one bends it into a saddle. psi turns the tilt direction and phi
 // moves the saddle, each by whole cycles per loop, so the loop stays
-// seamless. The same GLSL goes into the shell and lip shaders, so the two
+// seamless. The same GLSL goes into the dome and cut face shaders, so they
 // always agree.
 // ---------------------------------------------------------------------------
 const cutGlsl = /* glsl */`
@@ -482,8 +614,13 @@ fShells.add(params, 'dispCycles', -3, 3, 1).name('Displacement cycles / loop');
 
 layerUpdates.push((phase) => {
   const u = shellUniforms;
-  for (const m of [upperShell, lowerShell, upperCap, lowerCap]) m.scale.setScalar(params.sphereRadius);
-  u.uCapGain.value = params.capIntensity;
+  const lv = voice.amp;
+  const glow = 1 + params.voiceGlow * lv;
+  const pulse = reducedMotion.matches ? 0 : params.voicePulse;
+  const grow = reducedMotion.matches ? 1 : 0.94 + 0.06 * intro;
+  const radius = params.sphereRadius * (1 + pulse * lv) * grow;
+  for (const m of [upperShell, lowerShell, upperCap, lowerCap]) m.scale.setScalar(radius);
+  u.uCapGain.value = params.capIntensity * glow;
   u.uCool.value.set(params.coolColor);
   u.uWarm.value.set(params.warmColor);
   u.uColorSoft.value = params.colorSoftness;
@@ -491,190 +628,18 @@ layerUpdates.push((phase) => {
   u.uWarmVary.value = params.warmVariation;
   // the colours turn around the orb; integer cycles keep the loop seamless
   u.uColorPhase.value = params.colorPhase - params.colorCycles * phase;
-  u.uGap.value = params.gap;
+  u.uGap.value = params.gap + params.voiceGap * lv;
   u.uRound.value = params.edgeRound;
   u.uEdgeSoft.value = params.edgeSoftness;
   u.uFresnelPower.value = params.fresnelPower;
-  u.uShell.value = params.shellIntensity;
-  u.uInterior.value = params.interiorIntensity;
+  u.uShell.value = params.shellIntensity * glow;
+  u.uInterior.value = params.interiorIntensity * glow;
   u.uLimbFade.value = params.limbFade;
-  u.uDispAmount.value = params.dispAmount;
+  u.uDispAmount.value = params.dispAmount + params.voiceRipple * lv;
   u.uDispScale.value = params.dispScale;
   u.uDispDrift.value = params.dispDrift;
-  // integer cycles keep the loop seamless
-  u.uDispPhase.value = params.dispCycles * phase;
-});
-
-// ---------------------------------------------------------------------------
-// Lip: the bright edge of the upper shell, drawn as a thin band that runs
-// exactly along the cut on the sphere surface. The band lies along the
-// meridian; curl tips it into the sphere. It keeps the film look of the
-// original ribbon: a body brighter where it faces the camera, a fold where
-// it turns edge-on, and rims along both edges.
-// ---------------------------------------------------------------------------
-const lipVert = /* glsl */`
-  ${cutGlsl}
-  uniform float uRadius;
-  uniform float uWidth;
-  uniform float uCurl;
-
-  varying vec3 vNormalV;
-  varying vec3 vViewV;
-  varying float vV;
-  varying float vFront;
-
-  vec3 lipPos(float u, float v) {
-    float th = 6.2831853 * u;
-    vec2 dir = vec2(cos(th), sin(th));
-    float r = max(cutRim(dir), 0.03);
-    float y = cutH(dir * r);
-    vec3 onSphere = vec3(cos(th) * r, y, sin(th) * r);
-    // unit tangent along the meridian, towards the north pole
-    vec3 up = vec3(-cos(th) * y, r, -sin(th) * y);
-    vec3 across = cos(uCurl) * up - sin(uCurl) * onSphere;
-    return uRadius * onSphere + across * (v * uWidth);
-  }
-
-  void main() {
-    float u = uv.x;
-    float v = uv.y * 2.0 - 1.0;
-    vec3 p = lipPos(u, v);
-
-    float e = 0.001;
-    vec3 du = lipPos(u + e, v) - lipPos(u - e, v);
-    vec3 dv = lipPos(u, v + e) - lipPos(u, v - e);
-    // guard against a zero-length normal (NaN would be smeared by the bloom)
-    vec3 c = cross(du, dv);
-    float cl = length(c);
-    vec3 n = cl > 1e-9 ? c / cl : vec3(0.0, 0.0, 1.0);
-
-    vec4 mv = modelViewMatrix * vec4(p, 1.0);
-    float originZ = (modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).z;
-    vNormalV = normalize(normalMatrix * n);
-    vViewV = normalize(-mv.xyz);
-    vV = v;
-    // -1 at the back of the orb, +1 at the front
-    vFront = clamp((mv.z - originZ) / max(uRadius, 1e-4), -1.0, 1.0);
-    gl_Position = projectionMatrix * mv;
-  }
-`;
-
-const lipFrag = /* glsl */`
-  uniform vec3 uBodyColor;
-  uniform float uBodyIntensity;
-  uniform float uFoldPower;
-  uniform float uFoldIntensity;
-  uniform float uRimWidth;
-  uniform float uRimIntensity;
-  uniform vec3 uRimColorA;
-  uniform vec3 uRimColorB;
-  uniform float uBackDim;
-  uniform float uGain;
-
-  varying vec3 vNormalV;
-  varying vec3 vViewV;
-  varying float vV;
-  varying float vFront;
-
-  void main() {
-    float nl = length(vNormalV);
-    float facing = nl > 1e-5 ? min(abs(dot(vNormalV / nl, normalize(vViewV))), 1.0) : 0.0;
-
-  #ifdef SOFT_CORE
-    // halo: a wide, soft gaussian across the band
-    vec3 col = uBodyColor * exp(-vV * vV * 2.5);
-  #else
-    // translucent amber body, brighter where the band faces the camera
-    vec3 col = uBodyColor * uBodyIntensity * (0.25 + 0.75 * facing);
-
-    // cream fold where the band turns edge-on to the camera
-    col += vec3(1.0, 0.93, 0.82) * pow(1.0 - facing, uFoldPower) * uFoldIntensity;
-
-    // rims on both edges: cream outermost, fading to amber inside
-    float s = (1.0 - abs(vV)) / uRimWidth;
-    vec3 rimCol = mix(uRimColorA, uRimColorB, smoothstep(0.5, 2.0, s));
-    col += rimCol * exp(-s * s * 0.18) * uRimIntensity;
-  #endif
-
-    // the far side of the orb is fainter
-    col *= mix(uBackDim, 1.0, smoothstep(-1.0, 1.0, vFront)) * uGain;
-    if (any(isnan(col)) || any(isinf(col))) col = vec3(0.0);
-    gl_FragColor = vec4(clamp(col, 0.0, 64.0), 1.0);
-  }
-`;
-
-// uniforms both lip layers take straight from params (shared { value } objects)
-const lipUniforms = {
-  uRadius: { value: 1 },
-  uCurl: { value: 0 },
-  uBodyColor: { value: new THREE.Color() },
-  uBodyIntensity: { value: 0 },
-  uFoldPower: { value: 0 },
-  uFoldIntensity: { value: 0 },
-  uRimWidth: { value: 0 },
-  uRimIntensity: { value: 0 },
-  uRimColorA: { value: new THREE.Color() },
-  uRimColorB: { value: new THREE.Color() },
-  uBackDim: { value: 0 },
-};
-
-// uv.x runs around the cut, uv.y across the band
-const lipGeometry = new THREE.PlaneGeometry(1, 1, 256, 24);
-
-function makeLip(defines = {}) {
-  const mesh = new THREE.Mesh(lipGeometry, new THREE.ShaderMaterial({
-    vertexShader: lipVert,
-    fragmentShader: lipFrag,
-    defines,
-    uniforms: { ...cutUniforms, ...lipUniforms, uWidth: { value: 0 }, uGain: { value: 1 } },
-    side: THREE.DoubleSide,
-    transparent: true,
-    depthWrite: false,
-    depthTest: false,
-    blending: THREE.AdditiveBlending,
-  }));
-  mesh.frustumCulled = false;
-  orbGroup.add(mesh);
-  return mesh;
-}
-
-const haloLip = makeLip({ SOFT_CORE: 1 });
-const mainLip = makeLip();
-
-fLip.add(params, 'lip').name('Show lip');
-fLip.add(params, 'bandWidth', 0.005, 0.3, 0.001).name('Band width');
-fLip.add(params, 'curl', -1.5708, 1.5708, 0.01).name('Curl');
-fLip.addColor(params, 'bodyColor').name('Body colour');
-fLip.add(params, 'bodyIntensity', 0, 3, 0.01).name('Body brightness');
-fLip.add(params, 'foldPower', 1, 20, 0.1).name('Fold sharpness');
-fLip.add(params, 'foldIntensity', 0, 8, 0.01).name('Fold brightness');
-fLip.add(params, 'rimWidth', 0.01, 0.5, 0.001).name('Rim width');
-fLip.add(params, 'rimIntensity', 0, 5, 0.01).name('Rim brightness');
-fLip.addColor(params, 'rimColorA').name('Rim – outer');
-fLip.addColor(params, 'rimColorB').name('Rim – inner');
-fLip.add(params, 'backDim', 0, 1, 0.01).name('Back side brightness');
-fLip.add(params, 'haloIntensity', 0, 3, 0.01).name('Halo brightness');
-fLip.add(params, 'haloWidth', 1, 8, 0.05).name('Halo width');
-
-layerUpdates.push(() => {
-  const u = lipUniforms;
-  u.uRadius.value = params.sphereRadius;
-  u.uCurl.value = params.curl;
-  u.uBodyColor.value.set(params.bodyColor);
-  u.uBodyIntensity.value = params.bodyIntensity;
-  u.uFoldPower.value = params.foldPower;
-  u.uFoldIntensity.value = params.foldIntensity;
-  u.uRimWidth.value = params.rimWidth;
-  u.uRimIntensity.value = params.rimIntensity;
-  u.uRimColorA.value.set(params.rimColorA);
-  u.uRimColorB.value.set(params.rimColorB);
-  u.uBackDim.value = params.backDim;
-
-  const width = params.bandWidth * params.sphereRadius;
-  mainLip.visible = haloLip.visible = params.lip;
-  mainLip.material.uniforms.uWidth.value = width;
-  haloLip.material.uniforms.uWidth.value = width * params.haloWidth;
-  haloLip.material.uniforms.uGain.value = params.haloIntensity;
+  // integer cycles keep the loop seamless; the voice churn adds on top
+  u.uDispPhase.value = params.dispCycles * phase + voice.phase;
 });
 
 // ---------------------------------------------------------------------------
@@ -811,7 +776,31 @@ function resize() {
 let needsResize = true;
 window.addEventListener('resize', () => { needsResize = true; });
 
+// simTime runs the loop (the voice can slow it down or speed it up);
+// wallTime runs at real speed for the grain and the breathing
 let simTime = 0;
+let wallTime = 0;
+
+// CSS cubic-bezier(x1, y1, x2, y2) as an easing function of progress 0..1
+function cubicBezier(x1, y1, x2, y2) {
+  const bez = (t, a, b) => 3 * a * t * (1 - t) ** 2 + 3 * b * t * t * (1 - t) + t ** 3;
+  const slope = (t, a, b) => 3 * a * (1 - t) ** 2 + 6 * (b - a) * t * (1 - t) + 3 * (1 - b) * t * t;
+  return (x) => {
+    let t = x;
+    for (let i = 0; i < 8; i++) {
+      const d = slope(t, x1, x2);
+      if (Math.abs(d) < 1e-6) break;
+      t = THREE.MathUtils.clamp(t - (bez(t, x1, x2) - x) / d, 0, 1);
+    }
+    return bez(t, y1, y2);
+  };
+}
+const easeOut = cubicBezier(0.23, 1, 0.32, 1);
+
+// the orb fades in from black and grows from 0.94 over the first 600 ms
+const introSeconds = 0.6;
+let introTime = capture ? introSeconds : 0;
+let intro = capture ? 1 : 0;
 
 function update() {
   if (needsResize) { needsResize = false; resize(); }
@@ -826,10 +815,10 @@ function update() {
 
   for (const fn of layerUpdates) fn(phase);
 
-  bloom.strength = params.bloomStrength;
+  bloom.strength = params.bloomStrength + params.voiceBloom * voice.amp;
   bloom.radius = params.bloomRadius;
   bloom.threshold = params.bloomThreshold;
-  renderer.toneMappingExposure = params.exposure;
+  renderer.toneMappingExposure = params.exposure * intro;
 
   const blurPx = params.blur * drawingBufferSize.y;
   const twoRounds = blurPx > 24;
@@ -842,7 +831,7 @@ function update() {
   f.uChromatic.value = params.chromatic;
   f.uGrain.value = params.grain;
   f.uVignette.value = params.vignette;
-  f.uTime.value = simTime;
+  f.uTime.value = wallTime;
 }
 
 function renderFrame() {
@@ -850,10 +839,18 @@ function renderFrame() {
   composer.render();
 }
 
+// pause eases the motion to a stop and back instead of cutting it
+let timeScale = 1;
 const clock = new THREE.Clock();
 function tick() {
   const dt = Math.min(clock.getDelta(), 0.05);
-  if (!params.paused) simTime += dt;
+  introTime += dt;
+  intro = easeOut(Math.min(introTime / introSeconds, 1));
+  timeScale = THREE.MathUtils.damp(timeScale, params.paused ? 0 : 1, 1 / 0.1, dt);
+  if (params.paused && timeScale < 1e-3) timeScale = 0;
+  updateVoice(dt, wallTime, dt * timeScale);
+  wallTime += dt * timeScale;
+  simTime += dt * timeScale * voice.speed * (reducedMotion.matches ? 0.25 : 1);
   renderFrame();
   requestAnimationFrame(tick);
 }
@@ -867,7 +864,7 @@ if (capture) {
 }
 
 // debug / capture handle
-window.__orb = { params, setTime: (t) => { simTime = t; }, renderFrame, renderer, composer };
+window.__orb = { params, voice, setTime: (t) => { simTime = wallTime = t; }, renderFrame, renderer, composer };
 </script>
 </body>
 </html>

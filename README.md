@@ -18,15 +18,15 @@ Three.js and lil-gui load from the jsDelivr CDN, so the first load needs an inte
 
 ## Controls
 
-The panel in the top-right corner has four groups:
+The panel in the top-right corner has these groups:
 
 | Group | What it changes |
 | --- | --- |
 | **Shape** | Sphere radius, view tilt, the cut between the halves (tilt, saddle height, offset), gap, edge rounding and softness, the cut, saddle, wobble and spin cycles per loop and their phases, loop length, orb size |
 | **Shells** | Fresnel power, shell and interior brightness, limb fade, cool and warm colours, colour softness, phase and cycles per loop, warm edge width and variation, cut face brightness, displacement amount, scale, drift and cycles per loop |
-| **Lip** | An optional glowing band along the cut (off by default): band width and curl, body colour and brightness, fold, rim and halo settings, back side brightness |
 | **Post-processing** | Bloom strength, radius and threshold, blur, exposure, grain, chromatic aberration, vignette |
-| **Pause** | Freezes the animation |
+| **Voice** | Microphone toggle and a live level meter; the input range (silence / full level in dB), attack and release, and how much the voice opens the gap, adds glow, pulses the size, ripples and churns the cut faces, speeds up the loop and adds bloom |
+| **Pause** | Freezes the animation; with the mic on, the voice still changes the orb's brightness, size and gap |
 
 All motion is set in whole cycles per loop, so the animation always loops without a seam.
 
@@ -37,6 +37,12 @@ All motion is set in whole cycles per loop, so the animation always loops withou
 3. **Cut faces.** Each half is closed by a dense disc built in the vertex shader on the cut. A value-noise displacement map pushes it along its normal, edges included; the dome's edge follows the same noise, so the two stay joined. Near the rim the face bends up into the dome along a quarter-circle fillet, which rounds the edge.
 4. **Colour.** The halves are cool throughout. The warm colour appears only in a band along the edges where the halves meet, with a strength that varies around the orb and turns once per loop.
 5. **Post-processing chain.** `RenderPass → UnrealBloomPass → separable Gaussian blur (one or two rounds) → OutputPass (ACES tone mapping, sRGB) → final pass (chromatic aberration, vignette, grain)`. The blur radius is a fraction of the screen height, so the orb looks equally soft on a phone and on a 4K screen.
+
+## Voice control
+
+Open the **Voice** group and click **Enable microphone**. The orb then reacts to sound: louder input opens the gap between the halves, brightens and slightly enlarges the orb, makes the cut faces ripple and churn, and speeds up the loop. The level follows the voice with a fast attack and a slower release, so the orb swells with each syllable and settles between words. If it reacts to background noise, raise **Silence below (dB)**; if it barely moves, lower **Full level at (dB)**.
+
+Browsers only grant the microphone on `https://` or `localhost` pages (some also allow `file://`), so use a local server if the prompt does not appear. The audio never leaves the browser. With the system's Reduce motion setting on, the orb turns at a quarter of its usual speed (near still with the mic on) and the voice changes only its brightness, gap and ripple.
 
 Add `?capture=1440x1080` (any `WxH`) to the URL to render fixed-size frames with no panel and no animation loop; `window.__orb.setTime(t)` and `window.__orb.renderFrame()` then produce any frame on demand.
 
