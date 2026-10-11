@@ -42,7 +42,7 @@ All motion is set in whole cycles per loop, so the animation always loops withou
 
 Open the **Voice** group and click **Enable microphone**. The orb then reacts to sound: louder input opens the gap between the halves, brightens and slightly enlarges the orb, makes the cut faces ripple and churn, and speeds up the loop. The level follows the voice with a fast attack and a slower release, so the orb swells with each syllable and settles between words. If it reacts to background noise, raise **Silence below (dB)**; if it barely moves, lower **Full level at (dB)**.
 
-Browsers only grant the microphone on `https://` or `localhost` pages (some also allow `file://`), so use a local server if the prompt does not appear. The audio never leaves the browser.
+Browsers only grant the microphone on `https://` or `localhost` pages (some also allow `file://`), so use a local server if the prompt does not appear. The audio never leaves the browser. With the system's Reduce motion setting on, the orb turns at a quarter speed and the voice changes only its brightness and gap.
 
 Add `?capture=1440x1080` (any `WxH`) to the URL to render fixed-size frames with no panel and no animation loop; `window.__orb.setTime(t)` and `window.__orb.renderFrame()` then produce any frame on demand.
 

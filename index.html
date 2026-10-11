@@ -98,7 +98,8 @@ const params = {
   voiceChurn: 2.5,      // how fast the displacement churns while speaking (rad/s)
   voiceIdleSpeed: 0.06, // loop speed in silence while the mic is on (× base)
   voiceSpeed: 2.5,      // extra loop speed at full level (× base)
-  voiceMomentum: 0.7,   // seconds the motion takes to speed up / wind down
+  voiceSpinUp: 0.25,    // seconds the motion takes to speed up with the voice
+  voiceSpinDown: 1.2,   // seconds the motion takes to coast down after
   voiceBreath: 0.12,    // gentle breathing in silence, as a voice level
   voiceBreathSeconds: 4.5,
   voiceBloom: 0.3,      // extra bloom strength at full level
@@ -155,15 +156,21 @@ const fVoice = gui.addFolder('Voice');
 // displacement churn.
 //
 // With the mic on, the voice also drives the motion: voice.speed scales how
-// fast the loop runs, from voiceIdleSpeed in silence up with the level, and
-// eases there with some momentum, so the orb winds up while you speak and
-// coasts to a near stop after. In silence voice.amp breathes slowly, so the
-// orb never looks frozen; the layers read voice.amp (the level or the breath,
-// whichever is larger).
+// fast the loop runs, from voiceIdleSpeed in silence up with the level,
+// winding up quickly while you speak and coasting to a near stop after. In
+// silence voice.amp breathes slowly, so the orb never looks frozen; the
+// layers read voice.amp (the level with the breath blended in under it).
 // ---------------------------------------------------------------------------
+// honour the system "reduce motion" setting: the loop runs at a quarter speed
+// and the voice no longer scales, spins up or churns the orb; brightness and
+// the gap still follow it, so it still shows that it is listening
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+
 const voice = {
   level: 0,
   amp: 0,
+  breathMix: 0,
+  ackTime: Infinity,   // seconds since the mic turned on
   speed: 1,
   phase: 0,
   enabled: false,
@@ -194,6 +201,7 @@ async function startVoice() {
   voice.buf = new Float32Array(voice.analyser.fftSize);
   voice.ctx.createMediaStreamSource(voice.stream).connect(voice.analyser);
   voice.enabled = true;
+  voice.ackTime = 0;
   voiceButton.name('Disable microphone');
 }
 
@@ -216,16 +224,26 @@ function updateVoice(dt, time) {
   }
   const tau = target > voice.level ? params.voiceAttack : params.voiceRelease;
   voice.level = THREE.MathUtils.damp(voice.level, target, 1 / tau, dt);
-  voice.phase += dt * voice.level * params.voiceChurn;
+  voice.phase += dt * voice.level * (reducedMotion.matches ? 0 : params.voiceChurn);
 
-  // motion: near still in silence, faster with the voice; plain speed with the mic off
-  const speedTarget = voice.enabled ? params.voiceIdleSpeed + params.voiceSpeed * voice.level : 1;
-  voice.speed = THREE.MathUtils.damp(voice.speed, speedTarget, 1 / params.voiceMomentum, dt);
+  // motion: near still in silence, faster with the voice; plain speed with the mic off.
+  // It winds up quickly and coasts down slowly.
+  const speedUp = reducedMotion.matches ? 0 : params.voiceSpeed;
+  const speedTarget = voice.enabled ? params.voiceIdleSpeed + speedUp * voice.level : 1;
+  const spin = speedTarget > voice.speed ? params.voiceSpinUp : params.voiceSpinDown;
+  voice.speed = THREE.MathUtils.damp(voice.speed, speedTarget, 1 / spin, dt);
 
-  const breath = voice.enabled
-    ? params.voiceBreath * (0.5 - 0.5 * Math.cos(2 * Math.PI * time / params.voiceBreathSeconds))
-    : 0;
-  voice.amp = Math.max(voice.level, breath);
+  // the breathing fades in and out with the mic instead of switching
+  voice.breathMix = THREE.MathUtils.damp(voice.breathMix, voice.enabled ? 1 : 0, 1 / 0.6, dt);
+  const breath = voice.breathMix * params.voiceBreath
+    * (0.5 - 0.5 * Math.cos(2 * Math.PI * time / params.voiceBreathSeconds));
+  // soft union: the breath fills in under the voice and fades out as it gets louder
+  voice.amp = voice.level + breath * (1 - voice.level);
+
+  // one soft swell when the mic turns on, to show the orb is listening
+  voice.ackTime += dt;
+  const ack = voice.ackTime < 0.4 ? 0.35 * Math.sin(Math.PI * voice.ackTime / 0.4) : 0;
+  voice.amp += ack * (1 - voice.amp);
 }
 
 const voiceActions = {
@@ -247,7 +265,8 @@ fVoice.add(params, 'voiceRipple', 0, 0.4, 0.001).name('Ripple');
 fVoice.add(params, 'voiceChurn', 0, 10, 0.05).name('Churn');
 fVoice.add(params, 'voiceIdleSpeed', 0, 1, 0.01).name('Speed in silence');
 fVoice.add(params, 'voiceSpeed', 0, 6, 0.01).name('Speed up');
-fVoice.add(params, 'voiceMomentum', 0.05, 3, 0.01).name('Momentum (s)');
+fVoice.add(params, 'voiceSpinUp', 0.02, 2, 0.01).name('Spin up (s)');
+fVoice.add(params, 'voiceSpinDown', 0.05, 4, 0.01).name('Wind down (s)');
 fVoice.add(params, 'voiceBreath', 0, 0.5, 0.005).name('Breathing');
 fVoice.add(params, 'voiceBreathSeconds', 1, 10, 0.1).name('Breath length (s)');
 fVoice.add(params, 'voiceBloom', 0, 3, 0.01).name('Bloom');
@@ -592,7 +611,9 @@ layerUpdates.push((phase) => {
   const u = shellUniforms;
   const lv = voice.amp;
   const glow = 1 + params.voiceGlow * lv;
-  const radius = params.sphereRadius * (1 + params.voicePulse * lv);
+  const pulse = reducedMotion.matches ? 0 : params.voicePulse;
+  const grow = reducedMotion.matches ? 1 : 0.94 + 0.06 * intro;
+  const radius = params.sphereRadius * (1 + pulse * lv) * grow;
   for (const m of [upperShell, lowerShell, upperCap, lowerCap]) m.scale.setScalar(radius);
   u.uCapGain.value = params.capIntensity * glow;
   u.uCool.value.set(params.coolColor);
@@ -755,6 +776,27 @@ window.addEventListener('resize', () => { needsResize = true; });
 let simTime = 0;
 let wallTime = 0;
 
+// CSS cubic-bezier(x1, y1, x2, y2) as an easing function of progress 0..1
+function cubicBezier(x1, y1, x2, y2) {
+  const bez = (t, a, b) => 3 * a * t * (1 - t) ** 2 + 3 * b * t * t * (1 - t) + t ** 3;
+  const slope = (t, a, b) => 3 * a * (1 - t) ** 2 + 6 * (b - a) * t * (1 - t) + 3 * (1 - b) * t * t;
+  return (x) => {
+    let t = x;
+    for (let i = 0; i < 8; i++) {
+      const d = slope(t, x1, x2);
+      if (Math.abs(d) < 1e-6) break;
+      t = THREE.MathUtils.clamp(t - (bez(t, x1, x2) - x) / d, 0, 1);
+    }
+    return bez(t, y1, y2);
+  };
+}
+const easeOut = cubicBezier(0.23, 1, 0.32, 1);
+
+// the orb fades in from black and grows from 0.94 over the first 600 ms
+const introSeconds = 0.6;
+let introTime = capture ? introSeconds : 0;
+let intro = capture ? 1 : 0;
+
 function update() {
   if (needsResize) { needsResize = false; resize(); }
   const phase = 2 * Math.PI * simTime / params.loopSeconds;
@@ -771,7 +813,7 @@ function update() {
   bloom.strength = params.bloomStrength + params.voiceBloom * voice.amp;
   bloom.radius = params.bloomRadius;
   bloom.threshold = params.bloomThreshold;
-  renderer.toneMappingExposure = params.exposure;
+  renderer.toneMappingExposure = params.exposure * intro;
 
   const blurPx = params.blur * drawingBufferSize.y;
   const twoRounds = blurPx > 24;
@@ -792,14 +834,18 @@ function renderFrame() {
   composer.render();
 }
 
+// pause eases the motion to a stop and back instead of cutting it
+let timeScale = 1;
 const clock = new THREE.Clock();
 function tick() {
   const dt = Math.min(clock.getDelta(), 0.05);
+  introTime += dt;
+  intro = easeOut(Math.min(introTime / introSeconds, 1));
   updateVoice(dt, wallTime);
-  if (!params.paused) {
-    wallTime += dt;
-    simTime += dt * voice.speed;
-  }
+  timeScale = THREE.MathUtils.damp(timeScale, params.paused ? 0 : 1, 1 / 0.1, dt);
+  if (params.paused && timeScale < 1e-3) timeScale = 0;
+  wallTime += dt * timeScale;
+  simTime += dt * timeScale * voice.speed * (reducedMotion.matches ? 0.25 : 1);
   renderFrame();
   requestAnimationFrame(tick);
 }
