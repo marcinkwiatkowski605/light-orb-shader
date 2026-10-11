@@ -26,7 +26,7 @@ The panel in the top-right corner has these groups:
 | **Shells** | Fresnel power, shell and interior brightness, limb fade, cool and warm colours, colour softness, phase and cycles per loop, warm edge width and variation, cut face brightness, displacement amount, scale, drift and cycles per loop |
 | **Post-processing** | Bloom strength, radius and threshold, blur, exposure, grain, chromatic aberration, vignette |
 | **Voice** | Microphone toggle and a live level meter; the input range (silence / full level in dB), attack and release, and how much the voice opens the gap, adds glow, pulses the size, ripples and churns the cut faces, speeds up the loop and adds bloom |
-| **Pause** | Freezes the animation |
+| **Pause** | Freezes the animation; with the mic on, the voice still changes the orb's brightness, size and gap |
 
 All motion is set in whole cycles per loop, so the animation always loops without a seam.
 
@@ -42,7 +42,7 @@ All motion is set in whole cycles per loop, so the animation always loops withou
 
 Open the **Voice** group and click **Enable microphone**. The orb then reacts to sound: louder input opens the gap between the halves, brightens and slightly enlarges the orb, makes the cut faces ripple and churn, and speeds up the loop. The level follows the voice with a fast attack and a slower release, so the orb swells with each syllable and settles between words. If it reacts to background noise, raise **Silence below (dB)**; if it barely moves, lower **Full level at (dB)**.
 
-Browsers only grant the microphone on `https://` or `localhost` pages (some also allow `file://`), so use a local server if the prompt does not appear. The audio never leaves the browser. With the system's Reduce motion setting on, the orb turns at a quarter speed and the voice changes only its brightness and gap.
+Browsers only grant the microphone on `https://` or `localhost` pages (some also allow `file://`), so use a local server if the prompt does not appear. The audio never leaves the browser. With the system's Reduce motion setting on, the orb turns at a quarter of its usual speed (near still with the mic on) and the voice changes only its brightness, gap and ripple.
 
 Add `?capture=1440x1080` (any `WxH`) to the URL to render fixed-size frames with no panel and no animation loop; `window.__orb.setTime(t)` and `window.__orb.renderFrame()` then produce any frame on demand.
 

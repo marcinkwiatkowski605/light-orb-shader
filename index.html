@@ -161,9 +161,10 @@ const fVoice = gui.addFolder('Voice');
 // silence voice.amp breathes slowly, so the orb never looks frozen; the
 // layers read voice.amp (the level with the breath blended in under it).
 // ---------------------------------------------------------------------------
-// honour the system "reduce motion" setting: the loop runs at a quarter speed
-// and the voice no longer scales, spins up or churns the orb; brightness and
-// the gap still follow it, so it still shows that it is listening
+// honour the system "reduce motion" setting: the loop runs at a quarter of its
+// usual speed (near still with the mic on), and the voice no longer scales,
+// spins up or churns the orb; brightness and the gap still follow it, so it
+// still shows that it is listening
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 
 const voice = {
@@ -196,6 +197,8 @@ async function startVoice() {
     voice.starting = false;
   }
   voice.ctx = new AudioContext();
+  // the permission prompt can use up the click, leaving the context suspended (Safari)
+  voice.ctx.resume();
   voice.analyser = voice.ctx.createAnalyser();
   voice.analyser.fftSize = 1024;
   voice.buf = new Float32Array(voice.analyser.fftSize);
@@ -213,7 +216,9 @@ function stopVoice() {
   voiceButton.name('Enable microphone');
 }
 
-function updateVoice(dt, time) {
+// dt is real time (the level keeps following the mic while paused);
+// motionDt is scaled by the pause, so the churn stops with the rest
+function updateVoice(dt, time, motionDt) {
   let target = 0;
   if (voice.enabled) {
     voice.analyser.getFloatTimeDomainData(voice.buf);
@@ -224,7 +229,7 @@ function updateVoice(dt, time) {
   }
   const tau = target > voice.level ? params.voiceAttack : params.voiceRelease;
   voice.level = THREE.MathUtils.damp(voice.level, target, 1 / tau, dt);
-  voice.phase += dt * voice.level * (reducedMotion.matches ? 0 : params.voiceChurn);
+  voice.phase += motionDt * voice.level * (reducedMotion.matches ? 0 : params.voiceChurn);
 
   // motion: near still in silence, faster with the voice; plain speed with the mic off.
   // It winds up quickly and coasts down slowly.
@@ -841,9 +846,9 @@ function tick() {
   const dt = Math.min(clock.getDelta(), 0.05);
   introTime += dt;
   intro = easeOut(Math.min(introTime / introSeconds, 1));
-  updateVoice(dt, wallTime);
   timeScale = THREE.MathUtils.damp(timeScale, params.paused ? 0 : 1, 1 / 0.1, dt);
   if (params.paused && timeScale < 1e-3) timeScale = 0;
+  updateVoice(dt, wallTime, dt * timeScale);
   wallTime += dt * timeScale;
   simTime += dt * timeScale * voice.speed * (reducedMotion.matches ? 0.25 : 1);
   renderFrame();
